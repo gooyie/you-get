@@ -14,9 +14,10 @@ import re
 appkey = 'f3bb208b3d081dc8'
 SECRETKEY_MINILOADER = '1c15888dc316e05a15fdd0a02ed6584f'
 
-def get_srt_xml(id):
-    url = 'http://comment.bilibili.com/%s.xml' % id
-    return get_html(url)
+
+def get_srt_xml(cid):
+    url = 'http://comment.bilibili.com/{cid}.xml'.format(cid = cid)
+    return get_content(url)
 
 
 def parse_srt_p(p):
@@ -122,70 +123,145 @@ def bilibili_live_download_by_cid(cid, title, output_dir='.', merge=True, info_o
             download_urls([url], title, type_, total_size=None, output_dir=output_dir, merge=merge)
 
 
+def bilibili_download_srt_by_cid(cid, title, output_dir, info_only, **kwargs):
+    if not info_only and not dry_run:
+        if not kwargs['caption']:
+            print('Skipping danmaku.')
+            return
+        title = get_filename(title)
+        print('Downloading {title}.cmt.xml ...\n'.format(title=title))
+        xml = get_srt_xml(cid)
+        with open(os.path.join(output_dir, title + '.cmt.xml'), 'w', encoding='utf-8') as x:
+            x.write(xml)
+
+
+def is_bangumi_play_page(url):
+    return re.match(r'https?://bangumi\.bilibili\.com/anime/\d+/play#\d+', url) is not None
+
+
+def is_bangumi_list_page(url):
+    return re.match(r'https?://bangumi\.bilibili\.com/anime/\d+$', url) is not None
+
+def is_video_play_page(url):
+    return re.match(r'https?://www\.bilibili\.com/video/av\d+', url) is not None
+
+
+def is_movie_play_page(url):
+    return re.match(r'https?://bangumi\.bilibili\.com/movie/\d+$', url) is not None
+
+
+def is_live_page(url):
+    return re.match(r'https?://live\.bilibili\.com/\d+$', url) is not None
+
+
+def obtain_episode_id_from_url(url):
+    return match1(url, r'play#(\d+)')
+
+
+def obtain_season_id_from_url(url):
+    return match1(url, r'anime/(\d+)')
+
+
+def get_cid_by_episode_id(episode_id):
+    cont = post_content('http://bangumi.bilibili.com/web_api/get_source',
+                        post_data={'episode_id': episode_id})
+    jsondict = json.loads(cont)
+    assert jsondict['code'] == 0 and jsondict['message'] == 'success'
+    cid = jsondict['result']['cid']
+    return str(cid)
+
+
+def get_season_info_by_season_id(season_id):
+    url = 'http://bangumi.bilibili.com/jsonp/seasoninfo/{season_id}.ver'.format(season_id = season_id)
+    cont  = get_content(url)
+    jsonstr = match1(cont, r'^[^\{]*(\{.*\})[^\}]*$')
+    assert jsonstr
+    jsondict = json.loads(jsonstr)
+    assert jsondict['code'] == 0 and jsondict['message'] == 'success'
+    return jsondict['result']
+
+
+def obtain_title_in_season_info(seasoninfo, episode_id):
+    for episode in seasoninfo['episodes']:
+        if episode['episode_id'] == episode_id:
+            title = '{title}：第{index}话 {index_title}'.format(
+                title = seasoninfo['title'],
+                index = episode['index'],
+                index_title = episode['index_title'])
+            return title
+
+
+def find_id_in_html(html):
+    mo = re.search(r'(cid|ROOMID|vid|ykid|uid)\s*[=:]\s*["\']?(\d+)', html)
+    assert mo
+    return (mo.group(1), mo.group(2))
+
+
+def find_title_in_html(html):
+    title = r1_of([r'wb_title\s*=\s*["\'](.*?)["\']',
+                   r'<h1[^<>]*?>\s*([^<>_-]+)\s*',
+                   r'<title>\s*([^_-]+)\s*'], html)
+    assert title
+    title = unicodize(title)
+    title = unescape_html(title)
+    title = escape_file_path(title)
+    return title
+
+
 def bilibili_download(url, output_dir='.', merge=True, info_only=False, **kwargs):
     html = get_content(url)
+    title = find_title_in_html(html)
 
-    title = r1_of([r'<meta name="title" content="\s*([^<>]{1,999})\s*" />',
-                   r'<h1[^>]*>\s*([^<>]+)\s*</h1>'], html)
-    if title:
-        title = unescape_html(title)
-        title = escape_file_path(title)
+    if is_bangumi_play_page(url):
+        episode_id = obtain_episode_id_from_url(url)
+        season_id = obtain_season_id_from_url(url)
+        seasoninfo = get_season_info_by_season_id(season_id)
+        title = obtain_title_in_season_info(seasoninfo, episode_id)
+        cid = get_cid_by_episode_id(episode_id)
+        bilibili_download_by_cid(cid, title, output_dir=output_dir, merge=merge, info_only=info_only)
 
-    if re.match(r'https?://bangumi\.bilibili\.com/', url):
-        # quick hack for bangumi URLs
-        episode_id = r1(r'#(\d+)$', url) or r1(r'first_ep_id = "(\d+)"', html)
-        cont = post_content('http://bangumi.bilibili.com/web_api/get_source',
-                            post_data={'episode_id': episode_id})
-        cid = json.loads(cont)['result']['cid']
-        title = '%s [%s]' % (title, episode_id)
-        bilibili_download_by_cid(str(cid), title, output_dir=output_dir, merge=merge, info_only=info_only)
+    elif is_bangumi_list_page(url):
+        season_id = obtain_season_id_from_url(url)
+        seasoninfo = get_season_info_by_season_id(season_id)
+        episodes = seasoninfo['episodes']
+        episodes.sort(key = lambda e: float(e['index']))
+        for episode in episodes: # download one by one
+            title = '{title}：第{index}话 {index_title}'.format(
+                title = seasoninfo['title'],
+                index = episode['index'],
+                index_title = episode['index_title'])
+            cid = get_cid_by_episode_id(episode['episode_id'])
+            bilibili_download_by_cid(cid, title, output_dir=output_dir, merge=merge, info_only=info_only)
+            bilibili_download_srt_by_cid(cid, title, output_dir=output_dir, info_only=info_only, **kwargs)
+        return
 
-    else:
-        flashvars = r1_of([r'(cid=\d+)', r'(cid: \d+)', r'flashvars="([^"]+)"',
-                           r'"https://[a-z]+\.bilibili\.com/secure,(cid=\d+)(?:&aid=\d+)?"'], html)
-        assert flashvars
-        flashvars = flashvars.replace(': ', '=')
-        t, cid = flashvars.split('=', 1)
-        cid = cid.split('&')[0]
+    elif is_live_page(url):
+        t, cid = find_id_in_html(html)
+        assert t == 'ROOMID'
+        bilibili_live_download_by_cid(cid, title, output_dir=output_dir, merge=merge, info_only=info_only)
+
+    elif is_video_play_page(url) or is_movie_play_page(url):
+        t , cid = find_id_in_html(html)
         if t == 'cid':
-            if re.match(r'https?://live\.bilibili\.com/', url):
-                title = r1(r'<title>\s*([^<>]+)\s*</title>', html)
-                bilibili_live_download_by_cid(cid, title, output_dir=output_dir, merge=merge, info_only=info_only)
-
-            else:
-                # multi-P
-                cids = []
-                pages = re.findall('<option value=\'([^\']*)\'', html)
-                titles = re.findall('<option value=.*>\s*([^<>]+)\s*</option>', html)
-                for i, page in enumerate(pages):
-                    html = get_html("http://www.bilibili.com%s" % page)
-                    flashvars = r1_of([r'(cid=\d+)',
-                                       r'flashvars="([^"]+)"',
-                                       r'"https://[a-z]+\.bilibili\.com/secure,(cid=\d+)(?:&aid=\d+)?"'], html)
-                    if flashvars:
-                        t, cid = flashvars.split('=', 1)
-                        cids.append(cid.split('&')[0])
-                    if url.endswith(page):
-                        cids = [cid.split('&')[0]]
-                        titles = [titles[i]]
-                        break
-
-                # no multi-P
-                if not pages:
-                    cids = [cid]
-                    titles = [r1(r'<option value=.* selected>\s*([^<>]+)\s*</option>', html) or title]
-                for i in range(len(cids)):
-                    completeTitle=None
-                    if (title == titles[i]):
-                        completeTitle=title
-                    else:
-                        completeTitle=title+"-"+titles[i]#Build Better Title
-                    bilibili_download_by_cid(cids[i],
-                                             completeTitle,
-                                             output_dir=output_dir,
-                                             merge=merge,
-                                             info_only=info_only)
-
+            options = re.findall(r'<option value=\'(.*)\'[^<>]*>(.*)</option>', html)
+            if options: # multi-P
+                if re.search(r'index_\d+\.html$', url): # only download one
+                    subtitle = dict(options)[match1(url, r'(/video/av\d+/index_\d+\.html)')]
+                    title = re.sub(r'\(\d+\)$', '', title)
+                    better_title = '{title}：{subtitle}'.format(title=title, subtitle=subtitle) # Build Better Title
+                    bilibili_download_by_cid(cid, better_title, output_dir=output_dir, merge=merge, info_only=info_only)
+                else:
+                    for uri, subtitle in options: # download one by one
+                        html = get_content('http://www.bilibili.com{uri}'.format(uri = uri))
+                        t, cid = find_id_in_html(html)
+                        title = find_title_in_html(html)
+                        title = re.sub(r'\(\d+\)$', '', title)
+                        better_title = '{title}：{subtitle}'.format(title=title, subtitle=subtitle) # Build Better Title
+                        bilibili_download_by_cid(cid, better_title, output_dir=output_dir, merge=merge, info_only=info_only)
+                        bilibili_download_srt_by_cid(cid, title, output_dir=output_dir, info_only=info_only, **kwargs)
+                    return
+            else: # non multi-P
+                bilibili_download_by_cid(cid, title, output_dir=output_dir, merge=merge, info_only=info_only)
         elif t == 'vid':
             sina_download_by_vid(cid, title=title, output_dir=output_dir, merge=merge, info_only=info_only)
         elif t == 'ykid':
@@ -193,17 +269,12 @@ def bilibili_download(url, output_dir='.', merge=True, info_only=False, **kwargs
         elif t == 'uid':
             tudou_download_by_id(cid, title, output_dir=output_dir, merge=merge, info_only=info_only)
         else:
-            raise NotImplementedError(flashvars)
+            raise NotImplementedError('Unsupported Type: {type}'.format(type=t))
 
-    if not info_only and not dry_run:
-        if not kwargs['caption']:
-            print('Skipping danmaku.')
-            return
-        title = get_filename(title)
-        print('Downloading %s ...\n' % (title + '.cmt.xml'))
-        xml = get_srt_xml(cid)
-        with open(os.path.join(output_dir, title + '.cmt.xml'), 'w', encoding='utf-8') as x:
-            x.write(xml)
+    else:
+        raise NotImplementedError('Unsupported URL: {url}'.format(url=url))
+
+    bilibili_download_srt_by_cid(cid, title, output_dir=output_dir, info_only=info_only, **kwargs)
 
 
 site_info = "bilibili.com"
